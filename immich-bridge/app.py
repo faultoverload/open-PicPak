@@ -346,12 +346,12 @@ SELECT
     a."id", a."originalFileName", a."originalPath",
     a."fileCreatedAt" AS "date",
     al."albumName" AS "album"
-FROM assets a
-LEFT JOIN albums_assets_assets aaa ON aaa."assetsId" = a."id"
-LEFT JOIN albums al ON al."id" = aaa."albumsId"
-LEFT JOIN asset_faces af ON af."assetId" = a."id"
+FROM asset a
+LEFT JOIN album_asset aa ON aa."assetId" = a."id"
+LEFT JOIN album al ON al."id" = aa."albumId" AND al."deletedAt" IS NULL
+LEFT JOIN asset_face af ON af."assetId" = a."id" AND af."deletedAt" IS NULL
 LEFT JOIN person p ON p."id" = af."personId"
-WHERE a."isVisible" = TRUE
+WHERE a."visibility" = 'timeline'
   AND a."type" = 'IMAGE'
   AND a."deletedAt" IS NULL
   AND (%s::uuid IS NULL OR al."id" = %s::uuid)
