@@ -1,21 +1,22 @@
 """
-Immich Bridge — Phase 1
+Immich Bridge — Phase 2
 
 Pulls photos from Immich and serves them as 30,000-byte BWRY framebuffers
 compatible with the open-PicPak firmware. Single-file Flask app.
 
-Pipeline is an exact port of documentation/image-pipeline.md (BT.601 luma +
-unclamped Atkinson dithering, vertical flip, 2 bpp MSB-first packing).
+Pipeline: resize → perceptual (Oklab) or app (BT.601) dither → vertical flip
+→ 2 bpp MSB-first packing (4 px/byte).
 
 Endpoints:
     GET /frame.bin   -> application/octet-stream, exactly 30,000 bytes
-    GET /health      -> {"ok": true, "pool_size": int, "served": int}
+    GET /frame.png   -> PNG preview of the last-served frame (for debugging)
+    GET /health      -> {"ok": true, "pool_size": int, "served": int, "db": ...}
+    GET /info        -> {"last_id": "...", "pool_size": int, "dither_mode": "..."}
+    GET /next        -> force-advance to the next frame (returns new metadata)
+    GET /pool        -> list of {id, filename, date, album} in current pool
 
 The PicPak firmware wakes, GETs /frame.bin over WiFi, displays the buffer,
 and goes back to sleep. One frame per wake.
-
-Air-gap note: every config value below is a placeholder; the .env.example file
-documents the real variable names without leaking deployment-specific values.
 """
 from __future__ import annotations
 
@@ -25,7 +26,8 @@ import os
 import random
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
+from datetime import date, datetime
 from typing import Deque, Optional
 
 import psycopg2
@@ -65,6 +67,42 @@ LW = (0.299, 0.587, 0.114)
 # Atkinson diffusion kernel: distribute 1/8 of the error to six neighbours.
 ATKINSON = ((1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2))
 
+# Floyd-Steinberg kernel for perceptual dithering (serpentine scan).
+# (dx, dy, weight) — weight is relative to divisor=16.
+FLOYD_STEINBERG = ((1, 0, 7), (-1, 1, 3), (0, 1, 5), (1, 1, 1))
+
+
+# ---------------------------------------------------------------------------
+# Oklab perceptual colour space — used by "perceptual" dither mode
+# ---------------------------------------------------------------------------
+
+def _srgb_to_linear(value: float) -> float:
+    value /= 255.0
+    if value <= 0.04045:
+        return value / 12.92
+    return ((value + 0.055) / 1.055) ** 2.4
+
+
+def _linear_to_oklab(r: float, g: float, b: float) -> tuple[float, float, float]:
+    """Linear sRGB → Oklab (perceptually uniform)."""
+    l_ = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+    m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+    s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+    l_, m, s = l_ ** (1.0 / 3.0), m ** (1.0 / 3.0), s ** (1.0 / 3.0)
+    return (
+        0.2104542553 * l_ + 0.7936177850 * m - 0.0040720468 * s,
+        1.9779984951 * l_ - 2.4285922050 * m + 0.4505937099 * s,
+        0.0259040371 * l_ + 0.7827717662 * m - 0.8086757660 * s,
+    )
+
+
+def _palette_oklab() -> list[tuple[float, float, float]]:
+    """Convert the BWRY palette into Oklab coordinates."""
+    return [
+        _linear_to_oklab(*[_srgb_to_linear(c) for c in color])
+        for color in PALETTE
+    ]
+
 
 # ---------------------------------------------------------------------------
 # Configuration — all overridable via environment variables.
@@ -82,11 +120,31 @@ class Config:
         self.db_password: str = os.environ.get("IMMICH_DB_PASSWORD", "")
 
         # Immich storage layout
-        self.upload_location: str = os.environ.get("UPLOAD_LOCATION", "/usr/src/app/upload")
+        self.upload_location: str = os.environ.get(
+            "UPLOAD_LOCATION", "/usr/src/app/upload"
+        )
 
         # Pool rotation
         self.pool_size: int = int(os.environ.get("IMMICH_POOL_SIZE", "100"))
-        self.refresh_seconds: float = float(os.environ.get("IMMICH_POOL_REFRESH_SECONDS", "0"))
+        self.refresh_seconds: float = float(
+            os.environ.get("IMMICH_POOL_REFRESH_SECONDS", "0")
+        )
+
+        # Optional filters
+        self.album_id: Optional[str] = os.environ.get("IMMICH_ALBUM_ID") or None
+        self.person_id: Optional[str] = os.environ.get("IMMICH_PERSON_ID") or None
+
+        # Dithering mode: "perceptual" (Oklab Floyd-Steinberg) or "app" (BT.601 Atkinson)
+        self.dither_mode: str = os.environ.get(
+            "DITHER_MODE", "perceptual"
+        ).lower()
+        if self.dither_mode not in {"perceptual", "app"}:
+            raise ValueError("DITHER_MODE must be 'perceptual' or 'app'")
+
+        # LRU framebuffer cache size (avoids re-encoding on repeat serves)
+        self.cache_size: int = max(
+            1, int(os.environ.get("CACHE_SIZE", "20"))
+        )
 
         # Server
         self.host: str = os.environ.get("BRIDGE_HOST", "0.0.0.0")
@@ -101,30 +159,34 @@ log = logging.getLogger("immich-bridge")
 
 
 # ---------------------------------------------------------------------------
-# BWRY pipeline — port of documentation/image-pipeline.md §7
+# BWRY pipeline — dual dithering mode
 # ---------------------------------------------------------------------------
 
-def to_bwry_frame(img: Image.Image) -> bytes:
+def to_bwry_frame(img: Image.Image, mode: str | None = None) -> bytes:
     """Convert a PIL image into the 30,000-byte BWRY framebuffer.
 
-    Steps (see documentation/image-pipeline.md):
+    mode="app": BT.601 + unclamped Atkinson (original Phase 1 pipeline)
+    mode="perceptual": sRGB→Oklab + serpentine Floyd-Steinberg with chroma
+                       weighting (1.35× on a/b channels)
+
+    Steps:
         1. centre-crop to 4:3
         2. resize to 400x300
-        3. quantise per pixel (BT.601 weighted distance)
-        4. Atkinson error diffusion (unclamped)
-        5. vertical flip
-        6. pack 2 bpp, 4 px/byte, MSB-first
+        3. dither to 4-colour palette
+        4. vertical flip
+        5. pack 2 bpp, 4 px/byte, MSB-first
     """
+    if mode is None:
+        mode = CONFIG.dither_mode
+
     # 1. centre-crop to 4:3
     src_w, src_h = img.size
     target_ratio = WIDTH / HEIGHT  # 4/3
     if src_w / src_h > target_ratio:
-        # too wide -> crop sides
         new_w = int(round(src_h * target_ratio))
         left = (src_w - new_w) // 2
         img = img.crop((left, 0, left + new_w, src_h))
     else:
-        # too tall -> crop top/bottom
         new_h = int(round(src_w / target_ratio))
         top = (src_h - new_h) // 2
         img = img.crop((0, top, src_w, top + new_h))
@@ -132,7 +194,32 @@ def to_bwry_frame(img: Image.Image) -> bytes:
     # 2. resize
     img = img.convert("RGB").resize((WIDTH, HEIGHT), Image.LANCZOS)
 
-    # pull pixel data into float work buffers (error accumulates unclamped)
+    # 3. dither
+    if mode == "app":
+        code = _dither_atkinson(img)
+    else:
+        code = _dither_perceptual(img)
+
+    # 4+5. vertical flip + pack 2 bpp MSB-first
+    out = bytearray(FRAME_BYTES)
+    o = 0
+    for y in range(HEIGHT - 1, -1, -1):
+        row_base = y * WIDTH
+        for x in range(0, WIDTH, 4):
+            base = row_base + x
+            out[o] = (
+                (code[base] << 6)
+                | (code[base + 1] << 4)
+                | (code[base + 2] << 2)
+                | code[base + 3]
+            )
+            o += 1
+    return bytes(out)
+
+
+def _dither_atkinson(img: Image.Image) -> list[int]:
+    """BT.601 luma-weighted quantisation to 4-colour palette with unclamped
+    Atkinson error diffusion.  Original Phase 1 pipeline."""
     n = WIDTH * HEIGHT
     r = [0.0] * n
     g = [0.0] * n
@@ -144,7 +231,6 @@ def to_bwry_frame(img: Image.Image) -> bytes:
         g[i] = pg
         b[i] = pb
 
-    # 3+4. quantise + Atkinson dither (unclamped, in code values)
     code = [0] * n
     for y in range(HEIGHT):
         for x in range(WIDTH):
@@ -174,47 +260,102 @@ def to_bwry_frame(img: Image.Image) -> bytes:
                     r[j] += eR
                     g[j] += eG
                     b[j] += eB
-
-    # 5+6. vertical flip + pack 2 bpp MSB-first
-    out = bytearray(FRAME_BYTES)
-    o = 0
-    for y in range(HEIGHT - 1, -1, -1):
-        row_base = y * WIDTH
-        for x in range(0, WIDTH, 4):
-            base = row_base + x
-            out[o] = (
-                (code[base] << 6)
-                | (code[base + 1] << 4)
-                | (code[base + 2] << 2)
-                | code[base + 3]
-            )
-            o += 1
-    return bytes(out)
+    return code
 
 
-def image_from_path(path: str) -> bytes:
+def _dither_perceptual(img: Image.Image) -> list[int]:
+    """Oklab-space quantisation with serpentine Floyd-Steinberg error diffusion.
+
+    Uses 1.35× chroma weighting on the a/b channels to prioritise luminance
+    accuracy — human vision is far more sensitive to luminance errors than
+    chroma errors."""
+    n = WIDTH * HEIGHT
+    palette_ok = _palette_oklab()
+
+    # Convert all pixels to Oklab
+    L = [0.0] * n
+    A = [0.0] * n
+    B = [0.0] * n
+    px = img.load()
+    for i in range(n):
+        r, g, b = px[i % WIDTH, i // WIDTH]
+        L[i], A[i], B[i] = _linear_to_oklab(
+            _srgb_to_linear(r), _srgb_to_linear(g), _srgb_to_linear(b)
+        )
+
+    code = [0] * n
+    for y in range(HEIGHT):
+        # Serpentine scan: even rows left→right, odd rows right→left
+        reverse = bool(y & 1)
+        xs = range(WIDTH - 1, -1, -1) if reverse else range(WIDTH)
+        for x in xs:
+            i = y * WIDTH + x
+            lab = (L[i], A[i], B[i])
+
+            # Find closest palette entry in Oklab space
+            best = 0
+            best_dist = float("inf")
+            for k in range(4):
+                pl, pa, pb = palette_ok[k]
+                dL = lab[0] - pl
+                dA = lab[1] - pa
+                dB = lab[2] - pb
+                # 1.35× chroma weighting: penalise chroma errors harder
+                dist = dL * dL + 1.35 * dA * dA + 1.35 * dB * dB
+                if dist < best_dist:
+                    best_dist = dist
+                    best = k
+
+            code[i] = best
+
+            # Distribute error to neighbours (Floyd-Steinberg kernel, divisor=16)
+            pl, pa, pb = palette_ok[best]
+            eL = (lab[0] - pl) / 16.0
+            eA = (lab[1] - pa) / 16.0
+            eB = (lab[2] - pb) / 16.0
+
+            for dx, dy, weight in FLOYD_STEINBERG:
+                # In serpentine scan, flip horizontal offsets on reverse rows
+                actual_dx = -dx if reverse else dx
+                nx = x + actual_dx
+                ny = y + dy
+                if 0 <= nx < WIDTH and 0 <= ny < HEIGHT:
+                    j = ny * WIDTH + nx
+                    L[j] += eL * weight
+                    A[j] += eA * weight
+                    B[j] += eB * weight
+
+    return code
+
+
+def image_from_path(path: str, mode: str | None = None) -> bytes:
     """Load an image from disk and produce a frame."""
     with Image.open(path) as img:
-        return to_bwry_frame(img)
+        return to_bwry_frame(img, mode)
 
 
 # ---------------------------------------------------------------------------
 # Immich integration
 # ---------------------------------------------------------------------------
 
-# Query visible, non-deleted IMAGE assets. We don't filter on album/tag here
-# because the upstream Immich schema's exact column set drifts between
-# versions; isVisible + type + deletedAt is the minimal contract every
-# version supports.
+# Query with optional album and person filters.
+# Uses parameterised NULL placeholders for optional filters — when album_id
+# or person_id is None, the condition evaluates to TRUE and returns all matches.
 IMMICH_QUERY = """
 SELECT
-    a."id",
-    a."originalFileName",
-    a."originalPath"
+    a."id", a."originalFileName", a."originalPath",
+    a."fileCreatedAt" AS "date",
+    al."albumName" AS "album"
 FROM assets a
+LEFT JOIN albums_assets_assets aaa ON aaa."assetsId" = a."id"
+LEFT JOIN albums al ON al."id" = aaa."albumsId"
+LEFT JOIN asset_faces af ON af."assetId" = a."id"
+LEFT JOIN person p ON p."id" = af."personId"
 WHERE a."isVisible" = TRUE
   AND a."type" = 'IMAGE'
   AND a."deletedAt" IS NULL
+  AND (%s::uuid IS NULL OR al."id" = %s::uuid)
+  AND (%s::uuid IS NULL OR p."id" = %s::uuid)
 ORDER BY random()
 LIMIT %s;
 """
@@ -242,13 +383,35 @@ class ImmichSource:
             self._conn = self._connect()
             self._conn.autocommit = True
 
+    def db_health(self) -> dict:
+        """Check DB connectivity and return status info."""
+        result = {
+            "host": self.config.db_host,
+            "port": self.config.db_port,
+            "dbname": self.config.db_name,
+            "connected": False,
+            "error": None,
+        }
+        try:
+            self.ensure()
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            result["connected"] = True
+        except Exception as exc:
+            result["error"] = str(exc)
+        return result
+
     def fetch(self, n: int) -> list[dict]:
         last_err: Optional[Exception] = None
+        album = self.config.album_id
+        person = self.config.person_id
         for attempt in range(2):
             try:
                 self.ensure()
-                with self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    cur.execute(IMMICH_QUERY, (n,))
+                with self._conn.cursor(
+                    cursor_factory=psycopg2.extras.RealDictCursor
+                ) as cur:
+                    cur.execute(IMMICH_QUERY, (album, album, person, person, n))
                     return list(cur.fetchall())
             except Exception as exc:
                 log.warning("Immich query failed (attempt %d): %s", attempt + 1, exc)
@@ -267,13 +430,17 @@ class ImmichSource:
 # ---------------------------------------------------------------------------
 
 class FramePool:
-    """Thread-safe rotating deque of pre-encoded frames.
+    """Thread-safe rotating deque of pre-encoded frames with LRU cache.
 
     Pop-and-serve semantics:
         - on startup: query N random photos, encode them all, shuffle, push
         - each GET: pop next, serve it
         - on exhaustion: re-query and re-shuffle, skipping the last-served
           photo id so we never show the same frame twice in a row
+
+    LRU framebuffer cache: encoded frames are cached in an OrderedDict
+    keyed by asset_id so repeat serves (e.g. from /next force-advance
+    returning to a previously-seen photo) don't re-encode.
     """
 
     def __init__(self, source: ImmichSource, config: Config):
@@ -282,12 +449,25 @@ class FramePool:
         self._lock = threading.Lock()
         self._frames: Deque[tuple[str, bytes]] = deque()  # (asset_id, frame)
         self._last_id: Optional[str] = None
+        self._last_metadata: Optional[dict] = None  # metadata for /info endpoint
+        self._current_metadata: Optional[dict] = None  # metadata for /info endpoint
+        self._cache: OrderedDict[str, bytes] = OrderedDict()  # LRU framebuffer cache
+        self._pool_meta: list[dict] = []  # metadata for all assets in current pool
         self.served = 0
         self.errors = 0
         self.last_refresh: Optional[float] = None
 
     def _encode(self, asset: dict) -> Optional[tuple[str, bytes]]:
+        """Encode a single asset, using the LRU cache if available."""
         asset_id = asset["id"]
+
+        # Check cache first
+        with self._lock:
+            if asset_id in self._cache:
+                # Move to end (most-recently-used)
+                self._cache.move_to_end(asset_id)
+                return asset_id, self._cache[asset_id]
+
         rel_path = asset["originalPath"]
         full_path = os.path.join(self.config.upload_location, rel_path)
         try:
@@ -299,38 +479,56 @@ class FramePool:
             log.warning("Failed to encode asset %s: %s", asset_id, exc)
             return None
         if len(frame) != FRAME_BYTES:
-            log.warning("Asset %s produced %d bytes, expected %d", asset_id, len(frame), FRAME_BYTES)
+            log.warning(
+                "Asset %s produced %d bytes, expected %d",
+                asset_id, len(frame), FRAME_BYTES,
+            )
             return None
+
+        # Cache the encoded frame
+        with self._lock:
+            self._cache[asset_id] = frame
+            if len(self._cache) > self.config.cache_size:
+                self._cache.popitem(last=False)  # evict LRU
+            self._cache.move_to_end(asset_id)
+
         return asset_id, frame
 
     def _refresh_locked(self) -> None:
-        # Pull more than we need so we can skip the last-served one without
-        # ending up with a tiny pool.
         over_fetch = max(self.config.pool_size + 8, self.config.pool_size * 2)
         rows = self.source.fetch(over_fetch)
         encoded: list[tuple[str, bytes]] = []
+        meta: list[dict] = []
         for row in rows:
             item = self._encode(row)
             if item is None:
                 continue
             if item[0] == self._last_id:
-                # Avoid repeating the previous frame across rotations.
                 continue
             encoded.append(item)
+            meta.append({
+                "id": row["id"],
+                "filename": row["originalFileName"],
+                "date": str(row["date"]) if row.get("date") else None,
+                "album": row.get("album"),
+            })
         random.shuffle(encoded)
+        # Re-sync meta order with shuffled encoded order
+        id_to_meta = {m["id"]: m for m in meta}
+        meta_shuffled = [id_to_meta[aid] for aid, _ in encoded if aid in id_to_meta]
         self._frames.clear()
-        for item in encoded[: self.config.pool_size]:
-            self._frames.append(item)
+        self._pool_meta = []
+        for i, (asset_id, frame) in enumerate(encoded[: self.config.pool_size]):
+            self._frames.append((asset_id, frame))
+            if i < len(meta_shuffled):
+                self._pool_meta.append(meta_shuffled[i])
         self.last_refresh = time.time()
         log.info(
             "Pool refreshed: %d frames (queried %d, skipped last=%s)",
-            len(self._frames),
-            len(rows),
-            self._last_id,
+            len(self._frames), len(rows), self._last_id,
         )
 
     def ensure_filled(self) -> None:
-        """Make sure the pool has at least one frame before serving."""
         with self._lock:
             if not self._frames:
                 self._refresh_locked()
@@ -348,8 +546,34 @@ class FramePool:
                 return None
             asset_id, frame = self._frames.popleft()
             self._last_id = asset_id
+            self._last_metadata = None  # stale
             self.served += 1
             return frame
+
+    def force_next(self) -> Optional[dict]:
+        """Force-advance to the next frame and return its metadata."""
+        fb = self.next()
+        if fb is None:
+            return None
+        return self.info()
+
+    def info(self) -> dict:
+        """Return metadata about the last-served frame."""
+        with self._lock:
+            return {
+                "last_id": self._last_id,
+                "pool_size": len(self._frames),
+                "served": self.served,
+                "errors": self.errors,
+                "dither_mode": self.config.dither_mode,
+                "album_id": self.config.album_id,
+                "person_id": self.config.person_id,
+            }
+
+    def pool_list(self) -> list[dict]:
+        """Return metadata for all assets currently in the pool."""
+        with self._lock:
+            return list(self._pool_meta)
 
     def stats(self) -> dict:
         with self._lock:
@@ -359,6 +583,8 @@ class FramePool:
                 "errors": self.errors,
                 "last_id": self._last_id,
                 "last_refresh": self.last_refresh,
+                "cache_size": len(self._cache),
+                "dither_mode": self.config.dither_mode,
             }
 
 
@@ -369,6 +595,9 @@ class FramePool:
 app = Flask(__name__)
 source = ImmichSource(CONFIG)
 pool = FramePool(source, CONFIG)
+
+# Shared reference to the last-served frame bytes for the /frame.png endpoint.
+_last_frame: Optional[bytes] = None
 
 
 def _fixture_frame() -> Optional[bytes]:
@@ -381,9 +610,34 @@ def _fixture_frame() -> Optional[bytes]:
     return image_from_path(path)
 
 
+def _decode_frame_to_png(frame: bytes) -> bytes:
+    """Decode a BWRY framebuffer back to a PNG for debugging/preview."""
+    img = Image.new("RGB", (WIDTH, HEIGHT))
+    px = img.load()
+    unpacked = [0] * (WIDTH * HEIGHT)
+    o = 0
+    for y in range(HEIGHT - 1, -1, -1):
+        row_base = y * WIDTH
+        for x in range(0, WIDTH, 4):
+            base = row_base + x
+            b = frame[o]
+            unpacked[base]     = (b >> 6) & 3
+            unpacked[base + 1] = (b >> 4) & 3
+            unpacked[base + 2] = (b >> 2) & 3
+            unpacked[base + 3] = b & 3
+            o += 1
+    for i in range(WIDTH * HEIGHT):
+        px[i % WIDTH, i // WIDTH] = PALETTE[unpacked[i]]
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf.getvalue()
+
+
 @app.get("/frame.bin")
 def frame() -> Response:
     """Serve the next pre-encoded BWRY framebuffer (30,000 bytes)."""
+    global _last_frame
     if CONFIG.fixture_path:
         fb = _fixture_frame()
         if fb is None:
@@ -394,9 +648,10 @@ def frame() -> Response:
         if fb is None:
             return Response(b"", status=503, mimetype="application/octet-stream")
 
-    # Belt-and-braces: refuse to ever ship a short frame. PicPak expects
-    # exactly 30,000 bytes; a partial buffer can lock the display.
-    assert len(fb) == FRAME_BYTES, f"frame is {len(fb)} bytes, expected {FRAME_BYTES}"
+    _last_frame = fb
+    assert len(fb) == FRAME_BYTES, (
+        f"frame is {len(fb)} bytes, expected {FRAME_BYTES}"
+    )
     return Response(
         fb,
         status=200,
@@ -408,15 +663,46 @@ def frame() -> Response:
     )
 
 
+@app.get("/frame.png")
+def frame_png() -> Response:
+    """Return a PNG preview of the last-served frame (for debugging)."""
+    if _last_frame is None:
+        return Response(b"", status=404)
+    png = _decode_frame_to_png(_last_frame)
+    return Response(png, status=200, mimetype="image/png",
+                    headers={"Cache-Control": "no-store"})
+
+
 @app.get("/health")
 def health() -> Response:
-    return jsonify(
-        {
-            "ok": True,
-            "fixture": CONFIG.fixture_path is not None,
-            **pool.stats(),
-        }
-    )
+    db_health = source.db_health() if not CONFIG.fixture_path else None
+    return jsonify({
+        "ok": True,
+        "fixture": CONFIG.fixture_path is not None,
+        "db": db_health,
+        **pool.stats(),
+    })
+
+
+@app.get("/info")
+def info() -> Response:
+    """Metadata about the last-served frame and current pool state."""
+    return jsonify(pool.info())
+
+
+@app.get("/next")
+def next_frame() -> Response:
+    """Force-advance to the next frame, returning its metadata."""
+    result = pool.force_next()
+    if result is None:
+        return jsonify({"error": "pool empty"}), 503
+    return jsonify(result)
+
+
+@app.get("/pool")
+def pool_endpoint() -> Response:
+    """List metadata for all assets in the current pool."""
+    return jsonify(pool.pool_list())
 
 
 def main() -> None:
@@ -428,16 +714,15 @@ def main() -> None:
         log.info("Fixture mode: serving %s on every request", CONFIG.fixture_path)
     else:
         log.info(
-            "Connecting to Immich at %s:%s/%s as %s",
-            CONFIG.db_host, CONFIG.db_port, CONFIG.db_name, CONFIG.db_user,
+            "Connecting to Immich at %s:%s/%s as %s (mode=%s)",
+            CONFIG.db_host, CONFIG.db_port, CONFIG.db_name,
+            CONFIG.db_user, CONFIG.dither_mode,
         )
         try:
             pool.ensure_filled()
         except Exception as exc:
-            # Don't crash on startup; /frame.bin will retry via the pool.
             log.error("Initial pool fill failed: %s", exc)
     log.info("Listening on %s:%d", CONFIG.host, CONFIG.port)
-    # threaded=True so concurrent PicPak wakes don't queue behind each other.
     app.run(host=CONFIG.host, port=CONFIG.port, threaded=True, use_reloader=False)
 
 

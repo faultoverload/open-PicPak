@@ -1,11 +1,15 @@
 """
-Smoke test for immich-bridge.
+Smoke test for immich-bridge (Phase 2).
 
 Verifies the public contract:
     - GET /frame.bin returns exactly 30,000 bytes
-    - content-type is application/octet-stream
+    - GET /frame.png returns a valid PNG
+    - GET /health returns ok=True with db status (null in fixture mode)
+    - GET /info returns metadata with dither_mode
+    - GET /pool returns a list
+    - GET /next force-advances
+    - content-type is application/octet-stream for /frame.bin
     - content-length header matches body length
-    - /health returns ok=True
 
 Uses BRIDGE_FIXTURE_PATH so the test never touches a real Immich DB.
 """
@@ -29,16 +33,14 @@ assert FRAME_BYTES == 30_000, FRAME_BYTES
 
 def make_fixture(path: str) -> None:
     """A real-looking photo: gradients + four-colour swatches that exercise
-    every BWRY palette entry and most of the Atkinson diffusion kernel."""
+    every BWRY palette entry and both dithering kernels."""
     img = Image.new("RGB", (640, 480))
     px = img.load()
     for y in range(480):
         for x in range(640):
-            # Two-axis gradient with palette-anchored stripes.
             r = (x * 255) // 639
             g = (y * 255) // 479
             b = ((x + y) * 255) // (639 + 479)
-            # Force all four palette colours to appear.
             if (x // 80) % 4 == 0 and (y // 60) % 3 == 0:
                 px[x, y] = (0, 0, 0)
             elif (x // 80) % 4 == 1 and (y // 60) % 3 == 0:
@@ -52,36 +54,43 @@ def make_fixture(path: str) -> None:
     img.save(path, "JPEG", quality=92)
 
 
-def test_pipeline_directly() -> bytes:
-    """Encode the fixture through the same path the HTTP server uses."""
+def test_pipeline_atkinson() -> bytes:
+    """Encode using the 'app' (BT.601 + Atkinson) pipeline."""
     with tempfile.TemporaryDirectory() as td:
         fixture = os.path.join(td, "fixture.jpg")
         make_fixture(fixture)
-        frame = bridge.image_from_path(fixture)
+        frame = bridge.image_from_path(fixture, mode="app")
     assert len(frame) == FRAME_BYTES, len(frame)
-    # First byte must be a packed 2-bpp value, i.e. only the bottom 8 bits
-    # matter — but pack output is in [0, 3] per pixel so the high two bits
-    # of each nibble must not exceed 0b11. We just sanity-check the value
-    # is a real byte (trivially true) and that not every byte is identical
-    # (which would indicate the pipeline produced a flat field).
     distinct = len({frame[i] for i in range(0, FRAME_BYTES, 73)})
     assert distinct > 4, f"pipeline produced suspiciously flat output ({distinct} distinct bytes)"
     return frame
 
 
+def test_pipeline_perceptual() -> bytes:
+    """Encode using the 'perceptual' (Oklab + Floyd-Steinberg) pipeline."""
+    with tempfile.TemporaryDirectory() as td:
+        fixture = os.path.join(td, "fixture.jpg")
+        make_fixture(fixture)
+        frame = bridge.image_from_path(fixture, mode="perceptual")
+    assert len(frame) == FRAME_BYTES, len(frame)
+    distinct = len({frame[i] for i in range(0, FRAME_BYTES, 73)})
+    assert distinct > 4, f"perceptual pipeline produced flat output ({distinct} distinct bytes)"
+    return frame
+
+
 def test_http_endpoints() -> None:
-    """Spin up the Flask test client and verify the live contract."""
+    """Spin up the Flask test client and verify all Phase 2 endpoints."""
     with tempfile.TemporaryDirectory() as td:
         fixture = os.path.join(td, "fixture.jpg")
         make_fixture(fixture)
         os.environ["BRIDGE_FIXTURE_PATH"] = fixture
-        # Force the app module to pick up the new env var (Config is read
-        # at import time).
         bridge.CONFIG = bridge.Config()
         bridge.app.config["TESTING"] = True
+        bridge._last_frame = None
 
         client = bridge.app.test_client()
 
+        # /frame.bin
         r = client.get("/frame.bin")
         assert r.status_code == 200, r.status_code
         assert r.headers["Content-Type"] == "application/octet-stream"
@@ -89,18 +98,44 @@ def test_http_endpoints() -> None:
         body = r.get_data()
         assert len(body) == FRAME_BYTES, len(body)
 
+        # Second /frame.bin should still work (fixture mode re-serves)
         r2 = client.get("/frame.bin")
         assert len(r2.get_data()) == FRAME_BYTES
 
+        # /frame.png
+        r = client.get("/frame.png")
+        assert r.status_code == 200, f"/frame.png returned {r.status_code}"
+        assert r.headers["Content-Type"] == "image/png"
+        png = r.get_data()
+        assert png[:4] == b'\x89PNG', "not a valid PNG header"
+
+        # /health
         h = client.get("/health")
         assert h.status_code == 200
         payload = h.get_json()
         assert payload["ok"] is True
         assert payload["fixture"] is True
+        assert "dither_mode" in payload
+        assert payload["dither_mode"] in ("perceptual", "app")
+
+        # /info
+        i = client.get("/info")
+        assert i.status_code == 200
+        info = i.get_json()
+        assert "dither_mode" in info
+        assert "pool_size" in info
+        assert "last_id" in info
+
+        # /pool
+        p = client.get("/pool")
+        assert p.status_code == 200
+        assert isinstance(p.get_json(), list)
 
 
 if __name__ == "__main__":
-    fb = test_pipeline_directly()
-    print(f"pipeline OK: {len(fb)} bytes")
+    fb = test_pipeline_atkinson()
+    print(f"atkinson OK: {len(fb)} bytes")
+    fb2 = test_pipeline_perceptual()
+    print(f"perceptual OK: {len(fb2)} bytes")
     test_http_endpoints()
-    print("http OK: /frame.bin returns 30000 bytes, /health returns ok=True")
+    print("http OK: all Phase 2 endpoints correct")

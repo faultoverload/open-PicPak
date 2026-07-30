@@ -33,3 +33,5 @@ firmware/managed_components/
 firmware/main/screens.h
 firmware/screens-src/screens.h
 firmware/screens-src/*.png
+immich-bridge/.venv/
+immich-bridge/__pycache__/
