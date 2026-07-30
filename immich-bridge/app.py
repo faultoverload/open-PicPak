@@ -155,7 +155,12 @@ class Config:
 
 
 CONFIG = Config()
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 log = logging.getLogger("immich-bridge")
+log.info("immich-bridge starting (dither=%s, pool=%d)", CONFIG.dither_mode, CONFIG.pool_size)
 
 
 # ---------------------------------------------------------------------------
@@ -706,10 +711,6 @@ def pool_endpoint() -> Response:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
     if CONFIG.fixture_path:
         log.info("Fixture mode: serving %s on every request", CONFIG.fixture_path)
     else:
