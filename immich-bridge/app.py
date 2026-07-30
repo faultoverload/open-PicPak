@@ -459,7 +459,7 @@ class FramePool:
     def __init__(self, source: ImmichSource, config: Config):
         self.source = source
         self.config = config
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # re-entrant: _encode may be called inside _refresh_locked
         self._frames: Deque[tuple[str, bytes]] = deque()  # (asset_id, frame)
         self._last_id: Optional[str] = None
         self._last_metadata: Optional[dict] = None  # metadata for /info endpoint
