@@ -35,6 +35,14 @@ import psycopg2.extras
 from flask import Flask, Response, jsonify
 from PIL import Image
 
+# Register HEIC/HEIF support if available (common for iPhone photos in Immich)
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    HAVE_HEIF = True
+except ImportError:
+    HAVE_HEIF = False
+
 try:
     from dotenv import load_dotenv
 
