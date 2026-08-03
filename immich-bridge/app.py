@@ -111,7 +111,7 @@ class Config:
         self.api_key: str = os.environ.get("IMMICH_API_KEY", "")
 
         # Pool rotation
-        self.pool_size: int = int(os.environ.get("IMMICH_POOL_SIZE", "100"))
+        self.pool_size: int = int(os.environ.get("IMMICH_POOL_SIZE", "20"))
 
         # Optional album filter (requires album.read API key permission)
         self.album_id: Optional[str] = os.environ.get("IMMICH_ALBUM_ID") or None
@@ -387,7 +387,7 @@ class FramePool:
         return asset_id, frame
 
     def _refresh_locked(self) -> None:
-        over_fetch = max(self.config.pool_size + 8, self.config.pool_size * 2)
+        over_fetch = min(self.config.pool_size + 10, 100)
         rows = self.source.fetch(over_fetch)
         encoded: list[tuple[str, bytes]] = []
         meta: list[dict] = []
@@ -405,20 +405,9 @@ class FramePool:
                 "album": None,  # Album info not in search/random response
             })
 
-        if not encoded and rows:
-            # All fetched assets failed to encode — try one more batch
-            rows = self.source.fetch(over_fetch)
-            for row in rows:
-                item = self._encode(row)
-                if item is None or item[0] == self._last_id:
-                    continue
-                encoded.append(item)
-                meta.append({
-                    "id": row.get("id"),
-                    "filename": row.get("originalFileName"),
-                    "date": row.get("fileCreatedAt"),
-                    "album": None,
-                })
+        if not encoded:
+            log.error("Pool refresh failed: all %d assets could not be encoded", len(rows))
+            return
 
         random.shuffle(encoded)
         self._frames = deque(encoded)
