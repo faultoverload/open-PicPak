@@ -479,7 +479,14 @@ app = Flask(__name__)
 
 
 def _get_pool() -> FramePool:
-    return getattr(app, "_pool", None)
+    p = getattr(app, "_pool", None)
+    if p is None:
+        source = ImmichSource(CONFIG)
+        p = FramePool(source, CONFIG)
+        p.ensure()
+        app._pool = p
+        log.info("Pool lazily initialized")
+    return p
 
 
 @app.route("/frame.bin")
