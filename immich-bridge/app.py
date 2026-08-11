@@ -409,7 +409,13 @@ class ImmichSource:
         """Fetch up to n random timeline-visible IMAGE assets."""
         body: dict = {"size": n, "type": "IMAGE"}
         if self._person_ids is not None:
-            body["personIds"] = self._person_ids
+            if len(self._person_ids) == 0:
+                return []
+            # Pick one random person per fetch. Immich uses AND
+            # semantics on personIds (all must appear), which breaks
+            # with many IDs. Cycling through people one at a time
+            # gives variety across pool refreshes over time.
+            body["personIds"] = [random.choice(self._person_ids)]
         try:
             data = json.loads(_api_request("POST", "/api/search/random", body))
             return data if isinstance(data, list) else []
