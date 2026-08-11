@@ -116,6 +116,11 @@ class Config:
         # Optional album filter (requires album.read API key permission)
         self.album_id: Optional[str] = os.environ.get("IMMICH_ALBUM_ID") or None
 
+        # People-based filtering: "true" = auto-discover all named people,
+        # comma-separated UUIDs = explicit subset, unset = off (default).
+        # Requires person.read API key permission for auto-discovery.
+        self.people_filter: Optional[str] = os.environ.get("IMMICH_PEOPLE_FILTER") or None
+
         # Dithering mode
         self.dither_mode: str = os.environ.get("DITHER_MODE", "perceptual").lower()
         if self.dither_mode not in {"perceptual", "app"}:
@@ -138,7 +143,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("immich-bridge")
-log.info("immich-bridge starting (dither=%s, pool=%d)", CONFIG.dither_mode, CONFIG.pool_size)
+log.info("immich-bridge starting (dither=%s, pool=%d, people=%s)",
+         CONFIG.dither_mode, CONFIG.pool_size,
+         CONFIG.people_filter if CONFIG.people_filter else "off")
 
 
 # ---------------------------------------------------------------------------
@@ -313,15 +320,86 @@ def api_health() -> dict:
         return {"connected": False, "error": str(exc)}
 
 
+def _resolve_person_ids(config: Config) -> Optional[list[str]]:
+    """Resolve IMMICH_PEOPLE_FILTER into a list of person UUIDs.
+
+    Returns None when people filtering is off (no-op, same as current
+    behaviour).  Returns an empty list when filtering is on but no named
+    people are found — this effectively gates all photos (the /api/search/random
+    call with an empty personIds list returns nothing).  That is intentional:
+    the operator clearly wanted photos *with people*, and there are none yet.
+    """
+    pf = config.people_filter
+    if pf is None or pf == "":
+        return None
+
+    # Explicit UUID list
+    if pf.lower() != "true":
+        ids = [s.strip() for s in pf.split(",") if s.strip()]
+        if not ids:
+            log.warning("IMMICH_PEOPLE_FILTER parsed to zero UUIDs; people filter off")
+            return None
+        log.info("People filter: %d explicit UUID(s)", len(ids))
+        return ids
+
+    # Auto-discover: fetch all named people
+    log.info("People filter: auto-discovering named people from Immich")
+    try:
+        raw = _api_request("GET", "/api/people?withHidden=false&size=1000")
+    except Exception:
+        log.warning(
+            "Cannot fetch /api/people (missing person.read permission?). "
+            "People filter disabled."
+        )
+        return None
+
+    people = json.loads(raw)
+    person_list = people.get("people", people) if isinstance(people, dict) else people
+    if not isinstance(person_list, list):
+        log.warning("Unexpected /api/people response shape; people filter disabled")
+        return None
+
+    named: list[str] = []
+    unnamed: list[str] = []
+    for p in person_list:
+        pid = p.get("id")
+        if not pid:
+            continue
+        name = p.get("name", "").strip()
+        if name and not p.get("isHidden", False):
+            named.append(pid)
+        else:
+            unnamed.append(pid)
+
+    if not named:
+        log.warning(
+            "People filter enabled but zero named-unhidden people found "
+            "(%d unnamed/unhidden). Frame pool will be empty until people "
+            "are named in Immich.",
+            len(unnamed),
+        )
+        return []
+
+    log.info(
+        "People filter: %d named people discovered (%d unnamed skipped)",
+        len(named),
+        len(unnamed),
+    )
+    return named
+
+
 class ImmichSource:
     """Fetches random image assets from Immich API."""
 
     def __init__(self, config: Config):
         self.config = config
+        self._person_ids: Optional[list[str]] = _resolve_person_ids(config)
 
     def fetch(self, n: int) -> list[dict]:
         """Fetch up to n random timeline-visible IMAGE assets."""
         body: dict = {"size": n, "type": "IMAGE"}
+        if self._person_ids is not None:
+            body["personIds"] = self._person_ids
         try:
             data = json.loads(_api_request("POST", "/api/search/random", body))
             return data if isinstance(data, list) else []
@@ -440,6 +518,7 @@ class FramePool:
 
     def get_info(self) -> dict:
         with self._lock:
+            person_ids = self.source._person_ids
             return {
                 "last_id": self._last_id,
                 "pool_size": len(self._frames),
@@ -447,6 +526,10 @@ class FramePool:
                 "served": self.served,
                 "errors": self.errors,
                 "album_id": self.config.album_id,
+                "people_filter": self.config.people_filter or None,
+                "people_count": (
+                    len(person_ids) if person_ids is not None else None
+                ),
             }
 
     def get_pool(self) -> list[dict]:
@@ -528,6 +611,7 @@ def frame_png():
 def health():
     pool = _get_pool()
     api_status = api_health()
+    person_ids = pool.source._person_ids if pool else None
     return jsonify({
         "ok": api_status["connected"] and pool is not None,
         "api": api_status,
@@ -535,6 +619,8 @@ def health():
         "served": pool.served if pool else 0,
         "dither_mode": CONFIG.dither_mode,
         "fixture": CONFIG.fixture_path is not None,
+        "people_filter": CONFIG.people_filter or None,
+        "people_count": len(person_ids) if person_ids is not None else None,
     })
 
 

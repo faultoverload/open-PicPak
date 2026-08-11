@@ -59,7 +59,8 @@ def test_pipeline_atkinson() -> bytes:
     with tempfile.TemporaryDirectory() as td:
         fixture = os.path.join(td, "fixture.jpg")
         make_fixture(fixture)
-        frame = bridge.image_from_path(fixture, mode="app")
+        with Image.open(fixture) as img:
+            frame = bridge.to_bwry_frame(img, mode="app")
     assert len(frame) == FRAME_BYTES, len(frame)
     distinct = len({frame[i] for i in range(0, FRAME_BYTES, 73)})
     assert distinct > 4, f"pipeline produced suspiciously flat output ({distinct} distinct bytes)"
@@ -71,7 +72,8 @@ def test_pipeline_perceptual() -> bytes:
     with tempfile.TemporaryDirectory() as td:
         fixture = os.path.join(td, "fixture.jpg")
         make_fixture(fixture)
-        frame = bridge.image_from_path(fixture, mode="perceptual")
+        with Image.open(fixture) as img:
+            frame = bridge.to_bwry_frame(img, mode="perceptual")
     assert len(frame) == FRAME_BYTES, len(frame)
     distinct = len({frame[i] for i in range(0, FRAME_BYTES, 73)})
     assert distinct > 4, f"perceptual pipeline produced flat output ({distinct} distinct bytes)"
@@ -117,6 +119,11 @@ def test_http_endpoints() -> None:
         assert payload["fixture"] is True
         assert "dither_mode" in payload
         assert payload["dither_mode"] in ("perceptual", "app")
+        assert "people_filter" in payload
+        assert "people_count" in payload
+        # No people filter set → people_filter is None, people_count is None
+        assert payload["people_filter"] is None
+        assert payload["people_count"] is None
 
         # /info
         i = client.get("/info")
@@ -125,6 +132,10 @@ def test_http_endpoints() -> None:
         assert "dither_mode" in info
         assert "pool_size" in info
         assert "last_id" in info
+        assert "people_filter" in info
+        assert "people_count" in info
+        assert info["people_filter"] is None
+        assert info["people_count"] is None
 
         # /pool
         p = client.get("/pool")
