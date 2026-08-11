@@ -223,6 +223,82 @@ assets, so flashing, uploading and configuring all work from one self-hosted URL
 
 ---
 
+## Flashing the firmware
+
+### Build (optional)
+
+Pre-built firmware binaries are available in [GitHub Releases](https://github.com/faultoverload/open-PicPak/releases)
+for the current stable version. If you want to build from source:
+
+```bash
+cd firmware
+# Generate assets (one-time)
+python3 host/gen_render.py && python3 host/gen_policy.py
+# Build with Docker ESP-IDF
+docker run --rm -v "$PWD":/project -w /project espressif/idf:v5.5.3 \
+  bash -lc "idf.py set-target esp32c3 build"
+```
+
+Output binaries land in `firmware/build/`:
+| File | Flash address |
+|------|--------------|
+| `bootloader/bootloader.bin` | `0x0` |
+| `partition_table/partition-table.bin` | `0x8000` |
+| `ota_data_initial.bin` | `0x10000` |
+| `picpak_fw.bin` | `0x20000` |
+
+### Flash (esptool)
+
+Put the PicPak in download mode: **unplug USB, hold the button, plug USB back in,
+release button once the serial port appears** (usually `/dev/ttyACM0`).
+
+Then flash all four partitions in one command:
+
+```bash
+esptool --chip esp32c3 -p /dev/ttyACM0 --baud 115200 --no-stub \
+  --before default-reset --after hard-reset \
+  write-flash --flash-mode dio --flash-size 16MB --flash-freq 80m \
+  0x0 bootloader.bin \
+  0x8000 partition-table.bin \
+  0x10000 ota_data_initial.bin \
+  0x20000 picpak_fw.bin
+```
+
+> **Ignore the bootloader MD5 warning.** ESP-IDF patches the SHA digest in-flash,
+> changing the hash. The data is written correctly — this is a false alarm on
+> esptool v5.x.
+
+> **You MUST flash the partition table.** Skipping `0x8000` leaves the stock
+> partition layout in place, which points to the old firmware at a different
+> address. The device will boot the wrong code or nothing at all.
+
+> **`--no-stub` is required for the 32 MB flash chip** (`t25s256`). Without it,
+> esptool uploads a stub flasher that can't address the full chip.
+
+After flashing: **unplug USB, plug back in, open minicom at 115200.**
+
+### Provision (serial console)
+
+The factory NVS partition at `0x9000` is **never touched** — the device serial,
+MAC, and RF calibration survive. Provision WiFi credentials and a frame URL
+once (these persist across re-flashes):
+
+```
+SETWIFI YourSSID YourPassword
+SETURL  https://your-bridge.example.com/frame.bin
+SETWAKE 3600
+REFRESH
+```
+
+**`SETURL`** points to an HTTP(S) endpoint that serves a raw 30,000-byte BWRY
+framebuffer (400×300, 2 bpp, 4 px/byte, MSB-first). The [Immich bridge](immich-bridge/)
+is one such backend; any server that returns exactly 30,000 bytes of packed
+BWRY data works.
+
+Verify with `INFO` — you should see your SSID, URL, and `config: complete`.
+
+---
+
 ## Documentation
 
 | Doc | What it covers |

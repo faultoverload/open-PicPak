@@ -325,6 +325,24 @@ static uint32_t run_cycle_inner(const picpak_cfg_t *cfg, bool keep_online)
 
     led_on();   /* transfer done -> solid during render + EPD refresh */
 
+    /* Try to fetch a server-rendered frame from the configured URL. On success the
+     * framebuffer is already populated with the server image; on failure we fall back
+     * to the on-device Berry render (autonomous — works offline too). */
+    bool frame_fetched = false;
+    if (net_is_connected() && cfg->url[0]) {
+        int64_t t_fetch0 = esp_timer_get_time();
+        frame_fetched = net_http_fetch_frame(cfg->url, fb_writable(), EPD_FRAME_BYTES,
+                                             NULL, NULL, 0);
+        s_tm_fetch = (int32_t)((esp_timer_get_time() - t_fetch0) / 1000);
+        if (frame_fetched) {
+            ESP_LOGI(TAG, "server frame fetched (%d B, %ldms)",
+                     (int)EPD_FRAME_BYTES, (long)s_tm_fetch);
+            cfg_set_verified(true);
+        } else {
+            ESP_LOGW(TAG, "server frame fetch failed — falling back to on-device render");
+        }
+    }
+
     uint32_t field_override = 0;   /* a C2 SLEEP intent overrides this cycle's wake interval */
     if (!keep_online) {
         if (connected) {
@@ -346,12 +364,13 @@ static uint32_t run_cycle_inner(const picpak_cfg_t *cfg, bool keep_online)
          * a failed render pushes an all-zero framebuffer through the content gate and blanks
          * the panel (palette 0 = BLACK). On render-fail keep the last frame -- E-paper is
          * bistable, the last frame physically survives (design 32, Naht B / W-A32.2). */
-        if (present_gate_allows(berry_render()))
+        bool render_ok = frame_fetched ? true : berry_render();
+        if (present_gate_allows(render_ok))
             display_framebuffer_if_changed();   /* Wave-2 content-change gate (shared fingerprint) */
         else
             ESP_LOGW(TAG, "render failed -> keeping last frame (no present)");
     } else {
-        if (!berry_render())
+        if (!frame_fetched && !berry_render())
             ESP_LOGW(TAG, "render failed -> displaying current framebuffer contents");
         if (frame_changed()) {              /* a real refresh: decouple WLAN, refresh, re-associate */
             net_wifi_stop();
