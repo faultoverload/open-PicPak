@@ -119,11 +119,11 @@ def test_http_endpoints() -> None:
         assert payload["fixture"] is True
         assert "dither_mode" in payload
         assert payload["dither_mode"] in ("perceptual", "app")
-        assert "people_filter" in payload
-        assert "people_count" in payload
-        # No people filter set → people_filter is None, people_count is None
-        assert payload["people_filter"] is None
-        assert payload["people_count"] is None
+        assert "people_active" in payload
+        assert "people_total" in payload
+        # No people filter set → people_active is False, people_total is None
+        assert payload["people_active"] is False
+        assert payload["people_total"] is None
 
         # /info
         i = client.get("/info")
@@ -132,10 +132,10 @@ def test_http_endpoints() -> None:
         assert "dither_mode" in info
         assert "pool_size" in info
         assert "last_id" in info
-        assert "people_filter" in info
-        assert "people_count" in info
-        assert info["people_filter"] is None
-        assert info["people_count"] is None
+        assert "people_active" in info
+        assert "people_total" in info
+        assert info["people_active"] is False
+        assert info["people_total"] is None
 
         # /pool
         p = client.get("/pool")

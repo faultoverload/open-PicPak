@@ -395,6 +395,16 @@ class ImmichSource:
         self.config = config
         self._person_ids: Optional[list[str]] = _resolve_person_ids(config)
 
+    @property
+    def people_active(self) -> bool:
+        """True when the people filter is active (resolved >0 person IDs)."""
+        return self._person_ids is not None and len(self._person_ids) > 0
+
+    @property
+    def people_total(self) -> Optional[int]:
+        """Number of resolved person IDs, or None when filter is disabled."""
+        return len(self._person_ids) if self._person_ids is not None else None
+
     def fetch(self, n: int) -> list[dict]:
         """Fetch up to n random timeline-visible IMAGE assets."""
         body: dict = {"size": n, "type": "IMAGE"}
@@ -518,7 +528,6 @@ class FramePool:
 
     def get_info(self) -> dict:
         with self._lock:
-            person_ids = self.source._person_ids
             return {
                 "last_id": self._last_id,
                 "pool_size": len(self._frames),
@@ -526,10 +535,8 @@ class FramePool:
                 "served": self.served,
                 "errors": self.errors,
                 "album_id": self.config.album_id,
-                "people_filter": self.config.people_filter or None,
-                "people_count": (
-                    len(person_ids) if person_ids is not None else None
-                ),
+                "people_active": self.source.people_active,
+                "people_total": self.source.people_total,
             }
 
     def get_pool(self) -> list[dict]:
@@ -611,7 +618,7 @@ def frame_png():
 def health():
     pool = _get_pool()
     api_status = api_health()
-    person_ids = pool.source._person_ids if pool else None
+    source = pool.source if pool else None
     return jsonify({
         "ok": api_status["connected"] and pool is not None,
         "api": api_status,
@@ -619,8 +626,8 @@ def health():
         "served": pool.served if pool else 0,
         "dither_mode": CONFIG.dither_mode,
         "fixture": CONFIG.fixture_path is not None,
-        "people_filter": CONFIG.people_filter or None,
-        "people_count": len(person_ids) if person_ids is not None else None,
+        "people_active": source.people_active if source else False,
+        "people_total": source.people_total if source else None,
     })
 
 
