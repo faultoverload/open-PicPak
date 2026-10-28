@@ -131,7 +131,7 @@ static void button_task(void *arg)
                     ESP_LOGI(TAG, "triple-press -> %s setup mode", leaving ? "leave" : "enter");
                     cfg_set_force_setup(!leaving);  /* survives the browser's port-open reset */
                     vTaskDelay(pdMS_TO_TICKS(60));
-                    esp_restart();                  /* boot: setup screen+console, or normal run */
+                    guard_restart();                /* boot: setup screen+console, or normal run */
                 }
             }
         }
@@ -161,7 +161,7 @@ static void enter_deep_sleep(uint32_t seconds)
     configure_button();
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(200));
-        if (button_pressed()) { ESP_LOGI(TAG, "button -> reboot/refresh"); esp_restart(); }
+        if (button_pressed()) { ESP_LOGI(TAG, "button -> reboot/refresh"); guard_restart(); }
     }
 #endif
     led_off();   /* deep sleep -> LED off */
@@ -352,7 +352,7 @@ static uint32_t run_cycle_inner(const picpak_cfg_t *cfg, bool keep_online)
              * connection to hold. c2_poll self-skips when C2 is unconfigured/unbonded. */
             uint32_t c2_sl = 0;
             cmd_intent_t c2in = c2_poll(&c2_sl, NULL, 0);
-            if (c2in == CMD_INTENT_REBOOT) esp_restart();           /* never returns */
+            if (c2in == CMD_INTENT_REBOOT) guard_restart();         /* never returns */
             if (c2in == CMD_INTENT_SLEEP && c2_sl) field_override = c2_sl;
             /* RF off BEFORE the EPD charge-pump peak (brownout decoupling), then settle so the
              * supply recovers between the WiFi peak and the EPD peak. */
@@ -458,7 +458,7 @@ static uint32_t run_keep_awake(const picpak_cfg_t *cfg, uint32_t wake_s)
             if (c2_keepawake_active() && net_is_connected()) {
                 uint32_t c2_sl = 0;
                 cmd_intent_t in = c2_poll(&c2_sl, NULL, C2_LONGPOLL_S);
-                if (in == CMD_INTENT_REBOOT) esp_restart();           /* never returns */
+                if (in == CMD_INTENT_REBOOT) guard_restart();         /* never returns */
                 if (in == CMD_INTENT_SLEEP)  return c2_sl ? c2_sl : wake_s;
                 if (in == CMD_INTENT_REFRESH) { by_c2_refresh = true; break; }  /* -> run_cycle below */
             } else {

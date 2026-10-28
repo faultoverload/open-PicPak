@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_app_desc.h"
+#include "esp_system.h"
 #include "nvs.h"
 
 static const char *TAG = "guard";
@@ -127,5 +128,11 @@ void guard_check_and_run(void)
 }
 
 void guard_mark_stable(void) { nvs_set_bad(0); }
+
+void guard_restart(void)
+{
+    nvs_set_bad(guard_on_planned_restart(nvs_get_bad()));
+    esp_restart();
+}
 unsigned guard_bad_boots(void) { return nvs_get_bad(); }
 void guard_clear(void) { nvs_set_bad(0); }

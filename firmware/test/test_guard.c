@@ -39,6 +39,35 @@ int main(void)
     d = guard_on_boot(7, false, 8); CHECK(d.new_count == 8); CHECK(!d.safe_mode);   /* thr=8: 8 still ok */
     d = guard_on_boot(8, false, 8); CHECK(d.new_count == 9); CHECK(d.safe_mode);    /* thr=8: 9 trips */
 
+    /* 8. Button mashing: a long run of deliberate restarts (triple-press) with no stable marker
+     *    in between must NEVER trip safe mode -> a planned restart is neutral for the count. */
+    {
+        uint8_t c = 0; bool tripped = false;
+        for (int i = 0; i < 1000; i++) {
+            d = guard_on_boot(c, false, T);
+            tripped |= d.safe_mode;
+            c = guard_on_planned_restart(d.new_count);
+        }
+        CHECK(!tripped);
+        CHECK(c == 0);
+    }
+
+    /* 9. Neutral, not clearing: an earlier un-stable boot stays counted across a planned restart. */
+    d = guard_on_boot(2, false, T); CHECK(guard_on_planned_restart(d.new_count) == 2);
+    CHECK(guard_on_planned_restart(0) == 0);                    /* never underflows */
+
+    /* 10. Planned restarts interleaved with a real crash loop must not hide it: every other
+     *     boot crashes early (no marker), the rest restart deliberately -> still trips. */
+    {
+        uint8_t c = 0; bool tripped = false;
+        for (int i = 0; i < 2 * (T + 1) && !tripped; i++) {
+            d = guard_on_boot(c, false, T);
+            tripped = d.safe_mode;
+            c = (i & 1) ? guard_on_planned_restart(d.new_count) : d.new_count;
+        }
+        CHECK(tripped);
+    }
+
     if (fails == 0) { printf("ALL GUARD CORE TESTS PASSED\n"); return 0; }
     printf("%d CHECK(S) FAILED\n", fails);
     return 1;

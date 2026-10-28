@@ -31,4 +31,12 @@ static inline guard_decision_t guard_on_boot(uint8_t prev_count, bool fresh_app,
     return d;
 }
 
+/* Count to persist right before a deliberate restart (triple-press, C2 reboot): undo this
+ * boot's own increment, so the restart is neutral. NOT a clear — earlier un-stable boots stay
+ * counted, so a real crash loop interleaved with planned restarts still trips. Pure. */
+static inline uint8_t guard_on_planned_restart(uint8_t cur_count)
+{
+    return cur_count ? (uint8_t)(cur_count - 1u) : 0u;
+}
+
 #endif /* GUARD_CORE_H */

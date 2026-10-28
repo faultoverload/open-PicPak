@@ -15,6 +15,10 @@ void guard_check_and_run(void);
  * (e.g. entry into enter_deep_sleep). Cheap, idempotent. */
 void guard_mark_stable(void);
 
+/* Deliberate restart (triple-press, button reboot, C2 reboot): undo this boot's increment so
+ * the restart is neutral for the bootloop counter, then esp_restart(). Never returns. */
+void guard_restart(void) __attribute__((noreturn));
+
 /* Console helpers (GUARD command). */
 unsigned guard_bad_boots(void);   /* current persisted bad-boot count */
 void     guard_clear(void);       /* bad_boots = 0 (recovery from the console) */
