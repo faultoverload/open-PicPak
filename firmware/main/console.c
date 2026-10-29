@@ -88,6 +88,7 @@ static void print_help(void)
            "  SETWIFI <ssid> <pass>   save WiFi (pass = rest of line)\r\n"
            "  SETWIFI ADD <ssid> <pass>|LIST|DEL <slug>   multi-WiFi store\r\n"
            "  SETURL  <url>           save frame URL\r\n"
+           "  SETBTNCD [s]            button cooldown after a button refresh (default 300)\r\n"
            "  NVSSET <ns> <key> <val> generic NVS string write (e.g. storage dev_sn ...)\r\n"
            "  INFO                    show status\r\n"
            "  REFRESH                 fetch image now + sleep\r\n"
@@ -199,6 +200,16 @@ static int handle(char *line, uint32_t boot_count)
             uint32_t s = (uint32_t)strtoul(rest, NULL, 10);
             esp_err_t e = cfg_set_wake_s(s);
             if (e == ESP_OK) printf("OK   wake interval = %lus\r\n", (unsigned long)s);
+            else printf("ERR  NVS write error %d\r\n", (int)e);
+        }
+    } else if (strcasecmp(cmd, "SETBTNCD") == 0) {
+        /* Button cooldown (seconds), NVS picpak/btn_cd_s. Empty = show current. */
+        if (rest[0] == '\0') {
+            printf("button cooldown = %lus\r\n", (unsigned long)cfg_btn_cooldown_s(DEFAULT_BTN_COOLDOWN_S));
+        } else {
+            uint32_t s = (uint32_t)strtoul(rest, NULL, 10);
+            esp_err_t e = cfg_set_btn_cooldown_s(s);
+            if (e == ESP_OK) printf("OK   button cooldown = %lus\r\n", (unsigned long)s);
             else printf("ERR  NVS write error %d\r\n", (int)e);
         }
     } else if (strcasecmp(cmd, "NVSSET") == 0) {

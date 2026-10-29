@@ -29,13 +29,19 @@ esp_err_t cfg_erase(void);   /* erases all keys in namespace "picpak" */
 uint32_t  cfg_wake_s(uint32_t fallback);
 esp_err_t cfg_set_wake_s(uint32_t secs);
 
+/* "btn_cd_s": button cooldown, seconds. After a button-triggered refresh, presses within this
+ * window are ignored (no WiFi/EPD). NVS (namespace "picpak", u32); console: SETBTNCD <s>. */
+#define DEFAULT_BTN_COOLDOWN_S 300   /* 5 min */
+uint32_t  cfg_btn_cooldown_s(uint32_t fallback);
+esp_err_t cfg_set_btn_cooldown_s(uint32_t secs);
+
 /* "verified": set true after a cycle actually connected + fetched a frame; reset to
  * false whenever new creds are written (SETWIFI/SETURL). Drives the on-device setup
  * screen (shown while not verified) — see main.c. */
 bool cfg_is_verified(void);
 void cfg_set_verified(bool v);
 
-/* "force_setup": set by a triple-press to open the setup console on the next boot
+/* "force_setup": request to open the setup console on the next boot (no longer set by the button)
  * (survives the browser's port-open reset, unlike RTC-RAM). Cleared after the console
  * has run. */
 bool cfg_force_setup(void);

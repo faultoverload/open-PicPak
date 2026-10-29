@@ -38,6 +38,8 @@
 #include "screens.h"   /* baked-in 400x300 BWRY setup screens (onboarding / console) */
 #include "berry.h"
 #include "fb.h"         /* Berry graphics stdlib -> the 30000-byte framebuffer */
+#include "button_core.h"    /* button = new picture + cooldown (pure, host-tested) */
+#include "esp_rtc_time.h"
 #include "present_core.h"   /* A32 W2: present-gate decision (present only on a valid frame) */
 #include "dev.h"        /* Berry device stdlib: mac/serial/chip/uptime/battery + nvs_str */
 #include "lowbatt.h"    /* smart low-battery gate (timer-poll + voltage-rise charge detect) */
@@ -97,55 +99,34 @@ static inline bool button_pressed(void)
     return gpio_get_level(BTN_GPIO) == 0;   /* active-low */
 }
 
-/* Triple-press detection via GPIO ISR -> works in ANY phase (console, run_cycle,
- * keep-awake), unlike the keep-awake-only poll. Three presses within 1.5s open the
- * setup console. The ISR only counts; a low-priority watcher does the NVS write +
- * restart (neither is ISR-safe). */
-/* Triple-press detection by POLLING GPIO2 in a dedicated task. An edge ISR on this pin
- * was unreliable: USB-reset glitches (rst:0x15 on every host port-open) fired phantom
- * presses, while real presses were missed. Polling reads the *stable* level every 30ms,
- * so sub-30ms glitches are ignored and a real ~100ms press is caught reliably (same
- * mechanism as the working single-press refresh). 3 presses within 1.5s toggle the setup
- * console (force_setup) and reboot. Runs in every phase (own task), stack generous for
- * the NVS write in cfg_set_force_setup(). */
-static void button_task(void *arg)
+/* Button = "pull a new picture", nothing else. After a button refresh, presses within the
+ * cooldown (NVS picpak/btn_cd_s, SETBTNCD) are ignored -- no WiFi, no EPD. RTC-RAM and the RTC
+ * clock survive deep sleep; a cold boot / port-open reset clears them -> the next press
+ * refreshes. (The former triple-press setup toggle is gone: kids found it, and its restart
+ * left the setup screen up. Setup is reachable over the USB console on any real boot.) */
+RTC_DATA_ATTR static uint64_t s_btn_last_s;      /* RTC seconds of the last button refresh */
+RTC_DATA_ATTR static bool     s_btn_last_valid;
+RTC_DATA_ATTR static uint64_t s_timer_wake_s;    /* RTC seconds of the scheduled timer wake */
+RTC_DATA_ATTR static bool     s_timer_wake_valid;
+
+static uint64_t rtc_now_s(void) { return esp_rtc_get_time_us() / 1000000ULL; }
+
+/* Decide on a press: refresh (and record it as the new cooldown start) or ignore. */
+static btn_decision_t button_press_decide(uint32_t wake_s)
 {
-    int count = 0;
-    int64_t first_us = 0, last_edge_us = 0;
-    bool prev = button_pressed();   /* seed with the current level so a button held at
-                                       boot is NOT counted as a press (avoids a toggle loop) */
-    for (;;) {
-        bool pressed = button_pressed();        /* gpio_get_level == 0, active-low */
-        if (pressed && !prev) {                 /* falling edge = press */
-            int64_t t = esp_timer_get_time();
-            if (t - last_edge_us > 150000) {    /* debounce: ignore edges <150ms apart (contact bounce) */
-                last_edge_us = t;
-                if (count == 0 || t - first_us > 1500000) { count = 1; first_us = t; }
-                else count++;
-                if (count >= 3) {
-                    count = 0;
-                    /* Toggle: in setup mode -> leave (normal run); otherwise -> enter.
-                     * force_setup stays set in NVS while the console is up (main clears it
-                     * only after console_run returns), so reading it gives the current mode. */
-                    bool leaving = cfg_force_setup();
-                    ESP_LOGI(TAG, "triple-press -> %s setup mode", leaving ? "leave" : "enter");
-                    cfg_set_force_setup(!leaving);  /* survives the browser's port-open reset */
-                    vTaskDelay(pdMS_TO_TICKS(60));
-                    guard_restart();                /* boot: setup screen+console, or normal run */
-                }
-            }
-        }
-        prev = pressed;
-        vTaskDelay(pdMS_TO_TICKS(30));
-    }
+    uint64_t now = rtc_now_s();
+    btn_decision_t d = btn_on_press(now, s_btn_last_valid, s_btn_last_s,
+                                    cfg_btn_cooldown_s(DEFAULT_BTN_COOLDOWN_S),
+                                    s_timer_wake_valid, s_timer_wake_s, wake_s);
+    if (!d.skip) { s_btn_last_s = now; s_btn_last_valid = true; }
+    return d;
 }
 
-/* Configure the button input + start the polling task. Called once, early in app_main,
- * so the triple-press works during every phase. No interrupt -> glitch-resistant. */
-static void button_init(void)
+/* Bounded wait (<=10 s) for the button to be released: the deep-sleep GPIO wake is
+ * level-low, so a held button would wake the device straight back up. */
+static void wait_button_release(void)
 {
-    configure_button();   /* GPIO2 input + pull-up, no interrupt */
-    xTaskCreate(button_task, "btn", 8192, NULL, 5, NULL);
+    for (int i = 0; i < 500 && button_pressed(); i++) vTaskDelay(pdMS_TO_TICKS(20));
 }
 
 static void enter_deep_sleep(uint32_t seconds)
@@ -166,12 +147,18 @@ static void enter_deep_sleep(uint32_t seconds)
 #endif
     led_off();   /* deep sleep -> LED off */
     esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+    s_timer_wake_s = rtc_now_s() + seconds;   /* an ignored press sleeps on to this */
+    s_timer_wake_valid = true;
 
     /* Button (GPIO2, active-low) as a second wakeup source. The ESP32-C3 has no
      * RTC-IO domain -> digital GPIO wakeup. Configure the pin only HERE (after the
      * WiFi phase) -> GPIO2 is never set during the USB-sensitive WiFi TX. */
     configure_button();
-    esp_deep_sleep_enable_gpio_wakeup(1ULL << BTN_GPIO, ESP_GPIO_WAKEUP_GPIO_LOW);
+    wait_button_release();
+    if (button_pressed())   /* still held after 10 s: timer wake only, no wake loop */
+        ESP_LOGW(TAG, "button held -> sleeping with timer wake only");
+    else
+        esp_deep_sleep_enable_gpio_wakeup(1ULL << BTN_GPIO, ESP_GPIO_WAKEUP_GPIO_LOW);
     ESP_LOGI(TAG, "=> deep sleep %lus (wake: timer OR button GPIO%d)",
              (unsigned long)seconds, BTN_GPIO);
     vTaskDelay(pdMS_TO_TICKS(80));   /* let log/serial flush out */
@@ -475,12 +462,13 @@ static uint32_t run_keep_awake(const picpak_cfg_t *cfg, uint32_t wake_s)
             if (button_pressed()) { by_button = true; break; }
         }
         if (by_button) {
-            /* Single press = immediate refresh. A TRIPLE press is handled
-             * asynchronously by the ISR watcher (force_setup + reboot), which fires
-             * during this short wait if it was a triple -> then we never reach run_cycle. */
-            ESP_LOGI(TAG, "button pressed -> immediate refresh (triple = setup, handled by ISR)");
-            vTaskDelay(pdMS_TO_TICKS(800));                          /* let a possible triple complete */
-            while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(20));  /* debounce release */
+            /* One press = pull a new picture, unless inside the cooldown. */
+            wait_button_release();
+            if (button_press_decide(wake_s).skip) {
+                ESP_LOGI(TAG, "button press inside cooldown -> ignored");
+                continue;
+            }
+            ESP_LOGI(TAG, "button pressed -> pull a new picture");
         } else {
             ESP_LOGI(TAG, "keep-awake: %s", by_c2_refresh ? "C2 refresh intent" : "periodic refresh");
         }
@@ -498,7 +486,7 @@ void app_main(void)
     logbuf_init();
     s_boot_count++;
     /* FIRST after wake: sample the battery before WiFi/EPD/Berry load the rail
-     * (ADC1_CH2/GPIO2, before button_init configures GPIO2 with a pull-up). */
+     * (ADC1_CH2/GPIO2, before configure_button() puts the pull-up on GPIO2). */
     dev_measure_battery();
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     ESP_LOGI(TAG, "==== PicPak FW boot #%lu (wakeup_cause=%d; 4=TIMER, 7=GPIO/Button) ====",
@@ -530,7 +518,19 @@ void app_main(void)
 
     led_init();
     led_on();   /* awake: LED on as soon as the device runs */
-    button_init();   /* triple-press -> toggle setup console, polled in any phase */
+    configure_button();   /* GPIO2 input + pull-up (polled in keep-awake) */
+
+    /* Button wake: one press = one new picture, then a cooldown. A press inside the cooldown
+     * goes straight back to sleep (keeping the scheduled timer wake) -- no WiFi, no EPD. */
+    if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+        btn_decision_t bd = button_press_decide(cfg_wake_s(DEFAULT_WAKE_S));
+        if (bd.skip) {
+            ESP_LOGI(TAG, "button press inside cooldown -> ignored, sleep %lus",
+                     (unsigned long)bd.sleep_s);
+            enter_deep_sleep(bd.sleep_s);   /* never returns */
+        }
+        ESP_LOGI(TAG, "button press -> pull a new picture");
+    }
 
     /* Smart low-battery gate (default-off NVS flag picpak/lb_on): below ARM the device polls in
      * short deep sleeps and resumes on a detected voltage rise (no VBUS HW), instead of running a
@@ -563,7 +563,7 @@ void app_main(void)
     bool skip_fetch = false;
     uint32_t console_arg = 0;
     console_action_t cact = CONSOLE_PROCEED;
-    bool forced = cfg_force_setup();   /* set by a triple-press on a previous run */
+    bool forced = cfg_force_setup();   /* legacy NVS request (the button no longer sets it) */
     if (fresh_boot) {
         picpak_cfg_t probe;
         bool have = cfg_load(&probe);
@@ -575,12 +575,12 @@ void app_main(void)
         if (forced)                  show_static_frame(screen_console);
         else if (!cfg_is_verified()) show_static_frame(screen_onboarding);
 
-        /* Keep the console open (long window) on a triple-press request OR when there
+        /* Keep the console open (long window) on a forced-setup request OR when there
          * are no usable creds yet; otherwise just a brief 3s peek before a normal run. */
         cact = console_run(s_boot_count, &console_arg, forced || !have);
         if (cact == CONSOLE_SLEEP) skip_fetch = true;
     }
-    if (forced) cfg_set_force_setup(false);   /* triple-press request consumed */
+    if (forced) cfg_set_force_setup(false);   /* request consumed */
 
     picpak_cfg_t cfg;
     bool have_cfg = cfg_load(&cfg);

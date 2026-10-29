@@ -20,9 +20,12 @@ steerable via a HOTP-authenticated **C2 command channel**.
    degrades gracefully (`store_fs_ok()==false`) and the device keeps running.
 4. **low-battery gate** (default-off) — below a threshold the device polls in short deep sleeps and
    resumes on a detected voltage rise, instead of running a full cycle on a near-dead cell.
-5. **console** — only on a *real* boot (power-on / reset / USB connect), never on a timer/button
-   wake; a triple-press on any wake forces it on the next boot.
-6. **run-cycle** — WiFi (multi-SSID, by RSSI + priority) → fetch a server-rendered frame *or* render
+5. **button** — one press = pull a new picture, nothing else. After a button refresh, presses
+   within the cooldown (`btn_cd_s`, `SETBTNCD`, default 5 min) are ignored: on battery the device
+   goes straight back to sleep (keeping its scheduled timer wake) with no WiFi and no EPD.
+6. **console** — only on a *real* boot (power-on / reset / USB connect), never on a timer/button
+   wake.
+7. **run-cycle** — WiFi (multi-SSID, by RSSI + priority) → fetch a server-rendered frame *or* render
    on-device with Berry → display **only on a changed frame** → C2 poll (if enabled) → deep sleep for
    `wake_s` (NVS, `SETWAKE`, default 1 h). On USB power the WLAN is held across cycles (decoupled only
    around the actual refresh) and the C2 channel **long-polls** for near-instant commands; on battery
@@ -34,6 +37,7 @@ steerable via a HOTP-authenticated **C2 command channel**.
 |---|---|
 | `main.c` | the wake flow above: wake → guard → store → low-batt → console → run-cycle → deep sleep |
 | `guard.{c,h}`, `guard_core.h` | **recovery guard** — bootloop → USB safe-mode (pure decision logic is host-testable) |
+| `button_core.h` | **button** — one press = new picture, cooldown decision (pure, host-testable) |
 | `config.{c,h}` | NVS config (SSID / password / frame URL), provisioned over the console |
 | `wifi_store.{c,h}` | **multi-SSID store** — several networks, selected by priority + RSSI |
 | `console.{c,h}` | USB-serial setup + diagnostics console (full command surface below) |
@@ -100,13 +104,14 @@ Defaults: threshold = 4, stable-uptime = 20000 ms (compile-time defaults in `gua
 
 ## Console
 
-On a real boot (or a forced triple-press) the USB-serial console exposes the setup + diagnostics
+On a real boot the USB-serial console exposes the setup + diagnostics
 surface. All writes persist to NVS:
 
 ```
 SETWIFI <ssid> <pass>                 save WiFi   (SETWIFI ADD/LIST/DEL <slug> = multi-WiFi store)
 SETURL  <url>                         save the frame URL
 SETWAKE <s>                           deep-sleep wake interval on battery (default 3600)
+SETBTNCD <s>                          button cooldown after a button refresh (default 300)
 NVSSET  <ns> <key> <val>              generic NVS string write (e.g. storage dev_sn ...)
 INFO                                  status
 REFRESH | SLEEP [s] | PRESS [n]       run a cycle now / sleep / simulate n button-press cycles
