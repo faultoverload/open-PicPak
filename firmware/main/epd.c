@@ -60,8 +60,11 @@ static void wait_busy(const char *tag, int timeout_ms)
 static void epd_reset(void)
 {
     gpio_set_level(PIN_RST, 1); vTaskDelay(pdMS_TO_TICKS(20));
-    gpio_set_level(PIN_RST, 0); vTaskDelay(pdMS_TO_TICKS(5));
-    gpio_set_level(PIN_RST, 1); vTaskDelay(pdMS_TO_TICKS(10));
+    /* 20 ms low: a 5 ms pulse does not wake the controller from its deep sleep (0x07) --
+     * BUSY then stays low and every step times out. Only a fresh boot, whose own reset holds
+     * the line low far longer, used to recover it. */
+    gpio_set_level(PIN_RST, 0); vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level(PIN_RST, 1); vTaskDelay(pdMS_TO_TICKS(20));
     wait_busy("reset", 1000);
 }
 
