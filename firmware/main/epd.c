@@ -4,6 +4,7 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include <string.h>
 
 static const char *TAG = "epd";
@@ -79,6 +80,57 @@ static void epd_set_ram_area(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
     epd_data(d, sizeof(d));
 }
 
+/* Full panel init (A/B wave, default-off): the complete register set for the panel's native
+ * (OTP) waveform, incl. the registers the short sequence below leaves at reset defaults --
+ * PFS, TSE (internal temperature sensor -> OTP waveform selection), PWS -- plus the vendor
+ * register page, closed again by the second 0xFF write. Row format { cmd, n, data... };
+ * 0xFF is a valid command here, so iterate by size, never by sentinel. */
+static const uint8_t EPD_INIT_FULL[] = {
+    0x00, 2, 0x07, 0x29,                                         /* PSR */
+    0x01, 2, 0x07, 0x00,                                         /* PWRR */
+    0x03, 3, 0x10, 0x54, 0x44,                                   /* PFS */
+    0x06, 3, 0xC0, 0xC0, 0xC0,                                   /* BTST */
+    0x30, 1, 0x08,                                               /* PLL */
+    0x41, 1, 0x00,                                               /* TSE: internal sensor */
+    0x50, 1, 0x37,                                               /* CDI */
+    0x61, 4, EPD_W >> 8, EPD_W & 0xFF, EPD_H >> 8, EPD_H & 0xFF, /* TRES */
+    0x65, 4, 0x00, 0x00, 0x00, 0x00,                             /* GSST */
+    0xE3, 1, 0x22,                                               /* PWS */
+    0xE7, 1, 0x1C,
+    0xE9, 1, 0x01,
+    0xFF, 1, 0xA5,                                               /* vendor page open */
+    0xEF, 8, 0x01, 0x32, 0x08, 0x32, 0x0A, 0x32, 0x0F, 0x19,
+    0xFD, 1, 0x01,
+    0xE8, 1, 0x00,
+    0xDF, 1, 0x3C,
+    0xDC, 1, 0x00,
+    0xDD, 1, 0x01,
+    0xDE, 1, 0x14,
+    0xFF, 1, 0xE3,                                               /* vendor page close */
+};
+
+/* Policy = data: NVS "epd"/"init" == "full" selects EPD_INIT_FULL (NVSSET epd init full);
+ * anything else (incl. absent) keeps the short factory sequence. */
+static bool full_init_selected(void)
+{
+    nvs_handle_t h; char v[8] = {0}; size_t n = sizeof(v); bool on = false;
+    if (nvs_open("epd", NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_str(h, "init", v, &n) == ESP_OK) on = (strcmp(v, "full") == 0);
+        nvs_close(h);
+    }
+    return on;
+}
+
+static void epd_send_seq(const uint8_t *seq, size_t len)
+{
+    for (size_t i = 0; i + 1 < len; ) {
+        uint8_t cmd = seq[i++], n = seq[i++];
+        epd_cmd(cmd);
+        if (n) epd_data(&seq[i], n);
+        i += n;
+    }
+}
+
 /* Panel init sequence for the 0x060401 panel. The register map (PSR/PWRR/BTST/PLL/CDI/TRES/
  * GSST/...) is the public UC81xx-class command set. The specific VALUES are the MANUFACTURER'S
  * FACTORY CALIBRATION for this panel -- empirically tuned by the vendor for these exact display
@@ -91,6 +143,13 @@ static void epd_set_ram_area(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 static void epd_init_panel(void)
 {
     epd_reset();
+    if (full_init_selected()) {
+        epd_send_seq(EPD_INIT_FULL, sizeof(EPD_INIT_FULL));
+        epd_cmd(0x04);
+        wait_busy("power_on", 2000);
+        ESP_LOGI(TAG, "panel init (FULL seq) + power on done");
+        return;
+    }
     epd_cmd(0x00); { uint8_t d[] = {0x07, 0x29}; epd_data(d, 2); }                          /* PSR */
     epd_cmd(0x01); { uint8_t d[] = {0x07, 0x00}; epd_data(d, 2); }                          /* PWRR */
     epd_cmd(0x06); { uint8_t d[] = {0x0F, 0x8B, 0x9C, 0x96}; epd_data(d, 4); }              /* BTST */
