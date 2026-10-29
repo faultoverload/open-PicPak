@@ -4,6 +4,7 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include <string.h>
 
 static const char *TAG = "epd";
 
@@ -154,6 +155,30 @@ void epd_write_full(const uint8_t *buf)
      * per-frame transform on the device. */
     epd_data(buf, EPD_FRAME_BYTES);
     ESP_LOGI(TAG, "frame written (%d B)", EPD_FRAME_BYTES);
+}
+
+/* Fill the whole panel RAM with one colour code (0=K 1=W 2=Y 3=R) without a 30 kB buffer. */
+void epd_write_solid(uint8_t code)
+{
+    if (!s_init_done) epd_init();
+    uint8_t chunk[1000];
+    memset(chunk, (code & 3) * 0x55, sizeof(chunk));
+    epd_set_ram_area(0, 0, EPD_W, EPD_H);
+    epd_cmd(0x10);
+    for (int off = 0; off < EPD_FRAME_BYTES; off += sizeof(chunk)) epd_data(chunk, sizeof(chunk));
+}
+
+/* De-ghost: drive every pixel through all four inks n times, ending on white, then sleep the
+ * panel. Clears image retention left by a frame that stayed static for a long time. */
+void epd_clear_cycles(int n)
+{
+    static const uint8_t seq[] = { 0, 1, 2, 3 };   /* K W Y R */
+    for (int c = 0; c < n; c++)
+        for (size_t i = 0; i < sizeof(seq); i++) {
+            epd_init(); epd_write_solid(seq[i]); epd_refresh();
+        }
+    epd_init(); epd_write_solid(1); epd_refresh();
+    epd_sleep();
 }
 
 void epd_refresh(void)

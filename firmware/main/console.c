@@ -4,6 +4,7 @@
 #include "net.h"
 #include "ota.h"
 #include "guard.h"
+#include "epd.h"
 #include "store.h"
 #include "wifi_store.h"
 #include "lowbatt.h"
@@ -95,6 +96,7 @@ static void print_help(void)
            "  LOG [CLEAR]             show / clear the FW-internal log ring\r\n"
            "  NETCLR                  discard connect cache (BSSID/IP) -> next connect cold\r\n"
            "  OTA                     OTA status: running/boot/next partition + image state\r\n"
+           "  EPD CLEAR [n]           de-ghost panel: n x K,W,Y,R full refreshes (default 2)\r\n"
            "  GUARD [CLEAR|THRESHOLD n|UPTIME ms]  bootloop-guard: status / clear / tune\r\n"
            "  STORE OK|LIST|GET k|SET k v|DEL k   littlefs key-value store\r\n"
            "  RTC STAT|GET k|SET k v|DEL k        RTC-RAM key-value (ephemeral)\r\n"
@@ -255,6 +257,20 @@ static int handle(char *line, uint32_t boot_count)
         printf("OK   connect cache discarded -> next connect does scan + DHCP\r\n");
     } else if (strcasecmp(cmd, "OTA") == 0) {
         ota_print_status();
+    } else if (strcasecmp(cmd, "EPD") == 0) {
+        char *sub = rest;
+        char *n = strchr(rest, ' ');
+        if (n) { *n++ = '\0'; while (*n == ' ') n++; }
+        if (strcasecmp(sub, "CLEAR") == 0) {
+            int cycles = (n && *n) ? atoi(n) : 2;
+            if (cycles < 1) cycles = 1;
+            if (cycles > 5) cycles = 5;
+            printf("EPD  clearing: %d x (K,W,Y,R) + white, ~%ds ...\r\n", cycles, (cycles * 4 + 1) * 13);
+            epd_clear_cycles(cycles);
+            printf("OK   panel cleared (white)\r\n");
+        } else {
+            printf("ERR  usage: EPD CLEAR [n]   (n = 1..5 cycles, default 2)\r\n");
+        }
     } else if (strcasecmp(cmd, "GUARD") == 0) {
         char *sub = rest;
         char *n = strchr(rest, ' ');

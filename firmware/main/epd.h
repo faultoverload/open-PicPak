@@ -14,3 +14,5 @@ void epd_init(void);                       /* SPI+GPIO, reset, panel init, power
 void epd_write_full(const uint8_t *buf);   /* 30000 B into RAM (cmd 0x10) */
 void epd_refresh(void);                    /* display refresh + wait */
 void epd_sleep(void);                      /* power off + deep sleep */
+void epd_write_solid(uint8_t code);        /* whole RAM = one colour code (0=K 1=W 2=Y 3=R) */
+void epd_clear_cycles(int n);              /* de-ghost: n x (K,W,Y,R) full refreshes, end white */

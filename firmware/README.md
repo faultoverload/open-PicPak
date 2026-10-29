@@ -112,6 +112,7 @@ INFO                                  status
 REFRESH | SLEEP [s] | PRESS [n]       run a cycle now / sleep / simulate n button-press cycles
 LOG [CLEAR] | NETCLR | OTA            log ring / drop connect cache / OTA status
 GUARD [CLEAR|THRESHOLD n|UPTIME ms]   bootloop guard: status / clear / tune
+EPD   CLEAR [n]                       de-ghost the panel: n x (K,W,Y,R) full refreshes, end white
 STORE OK|LIST|GET k|SET k v|DEL k     littlefs key-value store
 RTC   STAT|GET k|SET k v|DEL k        RTC-RAM key-value (ephemeral)
 NET   SCAN|TRY ssid pass|IP|SSID|RSSI|STOP|TXPOWER [dBm]
